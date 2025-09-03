@@ -138,3 +138,109 @@ let
            )
 in
   Result
+
+
+## Power Shell
+# Add-LocalPrefix.ps1
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+  [string]$Path
+)
+
+function Select-Folder {
+  param(
+    [string]$Title = 'Select target folder',
+    [string]$InitialDirectory = (Get-Location).Path
+  )
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = $Title
+    $dlg.SelectedPath = $InitialDirectory
+    $dlg.ShowNewFolderButton = $true
+    $result = $dlg.ShowDialog()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK -and
+        -not [string]::IsNullOrWhiteSpace($dlg.SelectedPath)) {
+      return $dlg.SelectedPath
+    }
+    return $null
+  } catch {
+    Write-Warning 'Folder dialog failed. Falling back to current folder.'
+    return $null
+  }
+}
+
+# Input handling: if no -Path, open folder picker; if canceled -> current folder
+if (-not $PSBoundParameters.ContainsKey('Path') -or [string]::IsNullOrWhiteSpace($Path)) {
+  $picked = Select-Folder -Title 'Select target folder' -InitialDirectory (Get-Location).Path
+  $Path = if ($picked) { $picked } else { (Get-Location).Path }
+}
+
+# Validate path
+$resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+if (-not $resolved) {
+  Write-Error ('Path not found: {0}' -f $Path)
+  return
+}
+$root = $resolved.Path
+
+# Word/Excel/PowerPoint only
+$officeExt = @(
+  # Word
+  '.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm',
+  # Excel
+  '.xls', '.xlsx', '.xlsm', '.xlsb', '.xlt', '.xltx', '.xltm',
+  # PowerPoint
+  '.ppt', '.pptx', '.pptm', '.pot', '.potx', '.potm', '.pps', '.ppsx', '.ppsm'
+)
+
+function Get-UniqueFileName {
+  param(
+    [Parameter(Mandatory=$true)][string]$Directory,
+    [Parameter(Mandatory=$true)][string]$BaseWithPrefix,  # '(Local) ' + BaseName
+    [Parameter(Mandatory=$true)][string]$Extension
+  )
+  $candidate = Join-Path $Directory ($BaseWithPrefix + $Extension)
+  if (-not (Test-Path -LiteralPath $candidate)) {
+    return [System.IO.Path]::GetFileName($candidate)
+  }
+  $i = 1
+  while ($true) {
+    $trialName = '{0} ({1}){2}' -f $BaseWithPrefix, $i, $Extension
+    $trialPath = Join-Path $Directory $trialName
+    if (-not (Test-Path -LiteralPath $trialPath)) {
+      return $trialName
+    }
+    $i++
+  }
+}
+
+# Enumerate files: exclude Hidden/System attributes
+Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+  Where-Object {
+    (($_.Attributes -band [IO.FileAttributes]::Hidden) -eq 0) -and
+    (($_.Attributes -band [IO.FileAttributes]::System) -eq 0)
+  } |
+  ForEach-Object {
+    $ext = ''
+    if ($_.Extension) { $ext = $_.Extension.ToLowerInvariant() }
+    if ($officeExt -notcontains $ext) { return }
+
+    $base = $_.BaseName
+
+    # Skip if starts with (Work), or already starts with (Local)
+    if ($base -match '^\(Work\)\s*' -or $base -match '^\(Local\)\s*') { return }
+
+    $prefixedBase = '(Local) ' + $base
+    $newName = Get-UniqueFileName -Directory $_.DirectoryName -BaseWithPrefix $prefixedBase -Extension $ext
+
+    if ($PSCmdlet.ShouldProcess($_.FullName, 'Rename to ' + $newName)) {
+      try {
+        Rename-Item -LiteralPath $_.FullName -NewName $newName
+      } catch {
+        Write-Warning ('Rename failed: {0} -> {1} | {2}' -f $_.FullName, $newName, $_.Exception.Message)
+      }
+    }
+  }
+
+Write-Host ('Done: Applied ''(Local)'' prefix to Word/Excel/PowerPoint files (Hidden/System excluded) under: {0}' -f $root)
