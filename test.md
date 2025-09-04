@@ -24,7 +24,7 @@ refcols AS (
   FROM   dba_cons_columns
   GROUP  BY owner, constraint_name
 ),
--- PK 컬럼 단위 집계
+-- PK 컬럼 단위 집계 (VARCHAR2만 사용)
 pk_agg AS (
   SELECT cc.owner, cc.table_name, cc.column_name,
          LISTAGG(c.constraint_name, ',') WITHIN GROUP(ORDER BY c.constraint_name) AS pk_names
@@ -36,7 +36,7 @@ pk_agg AS (
     AND  (:table_like IS NULL OR c.table_name LIKE UPPER(:table_like))
   GROUP  BY cc.owner, cc.table_name, cc.column_name
 ),
--- UNIQUE 컬럼 단위 집계
+-- UNIQUE 컬럼 단위 집계 (VARCHAR2만 사용)
 uq_agg AS (
   SELECT cc.owner, cc.table_name, cc.column_name,
          LISTAGG(c.constraint_name, ',') WITHIN GROUP(ORDER BY c.constraint_name) AS uq_names
@@ -48,7 +48,7 @@ uq_agg AS (
     AND  (:table_like IS NULL OR c.table_name LIKE UPPER(:table_like))
   GROUP  BY cc.owner, cc.table_name, cc.column_name
 ),
--- FK: 컬럼별로 "FK명→참조스키마.참조테이블(참조컬럼들)" 집약
+-- FK: 컬럼별 참조 요약
 fk_agg AS (
   SELECT cc.owner, cc.table_name, cc.column_name,
          LISTAGG(
@@ -67,10 +67,11 @@ fk_agg AS (
     AND  (:table_like IS NULL OR c.table_name LIKE UPPER(:table_like))
   GROUP  BY cc.owner, cc.table_name, cc.column_name
 ),
--- CHECK: 해당 제약에 연결된 컬럼 기준으로 식을 모아 집약
+-- CHECK: LONG(SEARCH_CONDITION) 미사용, SEARCH_CONDITION_VC만 사용
 ck_agg AS (
   SELECT cc.owner, cc.table_name, cc.column_name,
-         LISTAGG(c.search_condition, ' | ') WITHIN GROUP (ORDER BY c.constraint_name) AS check_conditions
+         LISTAGG(c.search_condition_vc, ' | ')
+           WITHIN GROUP (ORDER BY c.constraint_name) AS check_conditions
   FROM   dba_constraints c
   JOIN   dba_cons_columns cc
          ON c.owner=cc.owner AND c.constraint_name=cc.constraint_name
@@ -84,7 +85,6 @@ SELECT
   c.table_name,
   tcom.comments AS table_comment,
   c.column_name,
-  /* 가독성 좋은 데이터타입 표기 */
   CASE
     WHEN c.data_type IN ('CHAR','NCHAR','VARCHAR2','NVARCHAR2') THEN
          c.data_type || '(' || c.char_length || ' ' ||
@@ -96,7 +96,8 @@ SELECT
     ELSE c.data_type
   END AS data_type,
   c.nullable,
-  TRIM(BOTH ' ' FROM REPLACE(c.data_default, CHR(10), ' ')) AS data_default,
+  /* LONG에 함수 금지 → 그대로 노출 */
+  c.data_default AS data_default,
   CASE WHEN pk.pk_names IS NOT NULL THEN 'Y' ELSE 'N' END AS is_pk,
   pk.pk_names AS pk_name,
   CASE WHEN uq.uq_names IS NOT NULL THEN 'Y' ELSE 'N' END AS is_unique,
