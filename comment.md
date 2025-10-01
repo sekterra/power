@@ -153,4 +153,70 @@ ck_lines AS (
   FROM ALL_CONSTRAINTS ac
   WHERE ac.owner = NVL(:OWNER, USER)
     AND ac.constraint_type = 'C'
-    AND ac.search_condition_vc IS NOT NULL     -- 구버전
+    AND ac.search_condition_vc IS NOT NULL     -- 구버전(컬럼 없으면) 자동 SKIP
+  GROUP BY ac.owner, ac.table_name
+),
+
+-- 4-D) 제약 DDL 통합 (테이블별)
+constraint_lines AS (
+  SELECT owner, table_name,
+         -- PK/UK → CK → FK 순으로 보기 좋게 이어붙임
+         NVL(pk.ddl_clob, TO_CLOB('')) ||
+         NVL(ck.ddl_clob, TO_CLOB('')) ||
+         NVL(fk.ddl_clob, TO_CLOB('')) AS ddl_clob
+  FROM (
+    SELECT DISTINCT owner, table_name
+    FROM (
+      SELECT owner, table_name FROM pk_uk_lines
+      UNION SELECT owner, table_name FROM ck_lines
+      UNION SELECT owner, table_name FROM fk_lines
+    )
+  ) t
+  LEFT JOIN pk_uk_lines pk ON pk.owner = t.owner AND pk.table_name = t.table_name
+  LEFT JOIN ck_lines    ck ON ck.owner = t.owner AND ck.table_name = t.table_name
+  LEFT JOIN fk_lines    fk ON fk.owner = t.owner AND fk.table_name = t.table_name
+)
+
+SELECT
+    t.owner,
+    t.table_name,
+    -- 5-1) CREATE TABLE (제약 제외)
+    DBMS_METADATA.get_ddl('TABLE', t.table_name, t.owner)
+    ||
+    -- 5-2) 제약 DDL (해당 테이블에 제약이 없으면 자동 SKIP)
+    CASE
+      WHEN EXISTS (SELECT 1 FROM constraint_lines k
+                   WHERE k.owner = t.owner AND k.table_name = t.table_name
+                     AND k.ddl_clob IS NOT NULL AND LENGTH(k.ddl_clob) > 0)
+      THEN TO_CLOB(CHR(10)) ||
+           (SELECT k.ddl_clob FROM constraint_lines k
+             WHERE k.owner = t.owner AND k.table_name = t.table_name)
+      ELSE TO_CLOB('')
+    END
+    ||
+    -- 5-3) 테이블 COMMENT
+    CASE
+      WHEN EXISTS (SELECT 1 FROM table_comment_line x
+                   WHERE x.owner = t.owner AND x.table_name = t.table_name
+                     AND x.ddl_clob IS NOT NULL AND LENGTH(x.ddl_clob) > 0)
+      THEN TO_CLOB(CHR(10)) ||
+           (SELECT x.ddl_clob FROM table_comment_line x
+             WHERE x.owner = t.owner AND x.table_name = t.table_name)
+      ELSE TO_CLOB('')
+    END
+    ||
+    -- 5-4) 컬럼 COMMENT
+    CASE
+      WHEN EXISTS (SELECT 1 FROM column_comment_lines y
+                   WHERE y.owner = t.owner AND y.table_name = t.table_name
+                     AND y.ddl_clob IS NOT NULL AND LENGTH(y.ddl_clob) > 0)
+      THEN TO_CLOB(CHR(10)) ||
+           (SELECT y.ddl_clob FROM column_comment_lines y
+             WHERE y.owner = t.owner AND y.table_name = t.table_name)
+      ELSE TO_CLOB('')
+    END
+    AS full_ddl
+FROM ALL_TABLES t
+WHERE t.owner = NVL(:OWNER, USER)
+  AND ( :TABLE_LIKE IS NULL OR t.table_name LIKE UPPER(:TABLE_LIKE) || '%' )
+ORDER BY t.table_name;
