@@ -1,4 +1,4 @@
--- 0) DDL 출력 옵션
+-- 0) DDL 출력 옵션 (CREATE TABLE에서 제약 제외, SQL 끝에 ;)
 BEGIN
   DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'STORAGE', false);
   DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'SEGMENT_ATTRIBUTES', false);
@@ -10,7 +10,7 @@ END;
 /
 
 WITH
--- 1) 스키마 내 "컬럼명 → 표준 주석" 사전 (최빈값 채택)
+-- 1) 컬럼명 → 표준 주석(최빈) 사전
 dict AS (
   SELECT column_name, comments AS standard_comment
   FROM (
@@ -30,7 +30,7 @@ dict AS (
   WHERE rn = 1
 ),
 
--- 2) 테이블 COMMENT (기존 → 없으면 표준사전으로 보충)
+-- 2) 테이블 COMMENT (원본 → 없으면 표준사전 대체)
 table_comment_line AS (
   SELECT
       t.owner,
@@ -49,11 +49,11 @@ table_comment_line AS (
   LEFT JOIN ALL_TAB_COMMENTS tc
     ON tc.owner = t.owner AND tc.table_name = t.table_name
   LEFT JOIN dict d
-    ON UPPER(d.column_name) = UPPER(t.table_name)  -- 테이블명과 같은 컬럼명의 표준주석을 테이블 주석 대체로 사용
+    ON UPPER(d.column_name) = UPPER(t.table_name)
   WHERE t.owner = NVL(:OWNER, USER)
 ),
 
--- 3) 컬럼 COMMENT (기존 → 없으면 표준사전으로 보충)
+-- 3) 컬럼 COMMENT (원본 → 없으면 표준사전 대체)
 column_comment_lines AS (
   SELECT
       c.owner,
@@ -80,49 +80,77 @@ column_comment_lines AS (
   GROUP BY c.owner, c.table_name
 ),
 
--- 4) 제약조건 DDL (PK/UK/CK/FK)
-constraint_lines AS (
+-- 4-A) PK/UK DDL 생성
+pk_uk_lines AS (
   SELECT
-      c.owner,
-      c.table_name,
+      ac.owner,
+      ac.table_name,
       XMLAGG(
         XMLELEMENT(
           "x",
-          DBMS_METADATA.get_ddl('CONSTRAINT', c.constraint_name, c.owner) || CHR(10)
+          TO_CLOB('ALTER TABLE ' || ac.owner || '.' || ac.table_name ||
+                  ' ADD CONSTRAINT ' || ac.constraint_name || ' ' ||
+                  CASE ac.constraint_type WHEN 'P' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END ||
+                  ' (' ||
+                  (SELECT LISTAGG(acc.column_name, ', ') WITHIN GROUP (ORDER BY acc.position)
+                     FROM ALL_CONS_COLUMNS acc
+                    WHERE acc.owner = ac.owner AND acc.constraint_name = ac.constraint_name)
+                  || ');' || CHR(10))
         )
-        ORDER BY
-          CASE c.constraint_type WHEN 'P' THEN 1 WHEN 'U' THEN 2 WHEN 'C' THEN 3 WHEN 'R' THEN 4 ELSE 9 END,
-          c.constraint_name
+        ORDER BY CASE ac.constraint_type WHEN 'P' THEN 1 ELSE 2 END, ac.constraint_name
       ).EXTRACT('//text()').getClobVal() AS ddl_clob
-  FROM ALL_CONSTRAINTS c
-  WHERE c.owner = NVL(:OWNER, USER)
-    AND c.constraint_type IN ('P','U','C','R')
-    -- AND c.status = 'ENABLED'  -- 활성 제약만 원하면 주석 해제
-  GROUP BY c.owner, c.table_name
-)
+  FROM ALL_CONSTRAINTS ac
+  WHERE ac.owner = NVL(:OWNER, USER)
+    AND ac.constraint_type IN ('P','U')
+  GROUP BY ac.owner, ac.table_name
+),
 
-SELECT
-    t.owner,
-    t.table_name,
-    -- 5-1) CREATE TABLE (제약조건 제외)
-    DBMS_METADATA.get_ddl('TABLE', t.table_name, t.owner)
-    ||
-    -- 5-2) 제약조건 (별도 ALTER ADD CONSTRAINT)
-    TO_CLOB(CHR(10)) ||
-    NVL((SELECT ddl_clob FROM constraint_lines k
-         WHERE k.owner = t.owner AND k.table_name = t.table_name), TO_CLOB(''))
-    ||
-    -- 5-3) 테이블 COMMENT
-    TO_CLOB(CHR(10)) ||
-    NVL((SELECT ddl_clob FROM table_comment_line x
-         WHERE x.owner = t.owner AND x.table_name = t.table_name), TO_CLOB(''))
-    ||
-    -- 5-4) 컬럼 COMMENT
-    TO_CLOB(CHR(10)) ||
-    NVL((SELECT ddl_clob FROM column_comment_lines y
-         WHERE y.owner = t.owner AND y.table_name = t.table_name), TO_CLOB(''))
-    AS full_ddl
-FROM ALL_TABLES t
-WHERE t.owner = NVL(:OWNER, USER)
-  AND ( :TABLE_LIKE IS NULL OR t.table_name LIKE UPPER(:TABLE_LIKE) || '%' )
-ORDER BY t.table_name;
+-- 4-B) FK DDL 생성 (ON DELETE 규칙 반영)
+fk_lines AS (
+  SELECT
+      ac.owner,
+      ac.table_name,
+      XMLAGG(
+        XMLELEMENT(
+          "x",
+          TO_CLOB('ALTER TABLE ' || ac.owner || '.' || ac.table_name ||
+                  ' ADD CONSTRAINT ' || ac.constraint_name || ' FOREIGN KEY (' ||
+                  (SELECT LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position)
+                     FROM ALL_CONS_COLUMNS cc
+                    WHERE cc.owner = ac.owner AND cc.constraint_name = ac.constraint_name) ||
+                  ') REFERENCES ' || rcon.owner || '.' || rcon.table_name || ' (' ||
+                  (SELECT LISTAGG(rcc.column_name, ', ') WITHIN GROUP (ORDER BY rcc.position)
+                     FROM ALL_CONS_COLUMNS rcc
+                    WHERE rcc.owner = rcon.owner AND rcc.constraint_name = rcon.constraint_name) ||
+                  ')' ||
+                  CASE ac.delete_rule WHEN 'CASCADE' THEN ' ON DELETE CASCADE' ELSE '' END ||
+                  ';' || CHR(10))
+        )
+        ORDER BY ac.constraint_name
+      ).EXTRACT('//text()').getClobVal() AS ddl_clob
+  FROM ALL_CONSTRAINTS ac
+  JOIN ALL_CONSTRAINTS rcon
+    ON rcon.owner = ac.r_owner AND rcon.constraint_name = ac.r_constraint_name
+  WHERE ac.owner = NVL(:OWNER, USER)
+    AND ac.constraint_type = 'R'
+  GROUP BY ac.owner, ac.table_name
+),
+
+-- 4-C) CHECK 제약 DDL 생성 (SEARCH_CONDITION_VC 있을 때만)
+ck_lines AS (
+  SELECT
+      ac.owner,
+      ac.table_name,
+      XMLAGG(
+        XMLELEMENT(
+          "x",
+          TO_CLOB('ALTER TABLE ' || ac.owner || '.' || ac.table_name ||
+                  ' ADD CONSTRAINT ' || ac.constraint_name ||
+                  ' CHECK (' || ac.search_condition_vc || ');' || CHR(10))
+        )
+        ORDER BY ac.constraint_name
+      ).EXTRACT('//text()').getClobVal() AS ddl_clob
+  FROM ALL_CONSTRAINTS ac
+  WHERE ac.owner = NVL(:OWNER, USER)
+    AND ac.constraint_type = 'C'
+    AND ac.search_condition_vc IS NOT NULL     -- 구버전
