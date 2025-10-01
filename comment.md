@@ -137,6 +137,7 @@ fk_lines AS (
 ),
 
 -- 4-C) CHECK 제약 DDL 생성 (SEARCH_CONDITION_VC 있을 때만)
+-- 4-C) CHECK 제약 DDL 생성 (11g: SEARCH_CONDITION은 LONG이므로 DBMS_XMLGEN으로 CLOB 추출)
 ck_lines AS (
   SELECT
       ac.owner,
@@ -146,15 +147,27 @@ ck_lines AS (
           "x",
           TO_CLOB('ALTER TABLE ' || ac.owner || '.' || ac.table_name ||
                   ' ADD CONSTRAINT ' || ac.constraint_name ||
-                  ' CHECK (' || ac.search_condition_vc || ');' || CHR(10))
+                  ' CHECK (' ||
+                  -- LONG 컬럼(SEARCH_CONDITION) → CLOB 변환
+                  (
+                    SELECT
+                      XMLTYPE(
+                        DBMS_XMLGEN.getXML(
+                          'SELECT search_condition FROM all_constraints ' ||
+                          'WHERE owner = ''' || ac.owner || ''' ' ||
+                          'AND constraint_name = ''' || ac.constraint_name || ''''
+                        )
+                      ).EXTRACT('//SEARCH_CONDITION/text()').getClobVal()
+                    FROM dual
+                  )
+                  || ');' || CHR(10))
         )
         ORDER BY ac.constraint_name
       ).EXTRACT('//text()').getClobVal() AS ddl_clob
   FROM ALL_CONSTRAINTS ac
   WHERE ac.owner = NVL(:OWNER, USER)
     AND ac.constraint_type = 'C'
-    AND ac.search_condition_vc IS NOT NULL     -- 구버전(컬럼 없으면) 자동 SKIP
-  GROUP BY ac.owner, ac.table_name
+    -- 11g에서는 NULL 여부를 LONG에서 직접 못 보니, XML 변환 결과가 NULL이면 자연히 빈 문자열만 붙음
 ),
 
 -- 4-D) 제약 DDL 통합 (테이블별)
