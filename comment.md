@@ -1,135 +1,208 @@
+-- =========================================================
+-- CREATE TABLE (DBMS_METADATA.GET_DDL) + COMMENT(원본/사전) 스풀
+-- - 관리 DDL 테이블 없이 동작
+-- - 자신이 접근 가능한 객체 범위에서만 생성
+-- - ERD 도구 참조 용도
+-- =========================================================
+
+-- (선택) 불필요한 물리 옵션 제거: STORAGE/SEGMENT/TABLESPACE
 BEGIN
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'STORAGE', false);
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'SEGMENT_ATTRIBUTES', false);
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'TABLESPACE', false);
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'CONSTRAINTS', false);      -- CREATE TABLE에 제약 제외
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'REF_CONSTRAINTS', false);  -- CREATE TABLE에 FK 제외
-  DBMS_METADATA.set_transform_param(DBMS_METADATA.session_transform, 'SQLTERMINATOR', true);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE);
+  -- 제약조건은 ERD 용도에 유용하므로 기본값(TRUE) 유지. 필요시:
+  -- DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'CONSTRAINTS', TRUE);
 END;
 /
 
 WITH
-tgt AS (  -- 대상 테이블만 선필터
-  SELECT owner, table_name
-  FROM   ALL_TABLES
-  WHERE  owner = NVL(:OWNER, USER)
-  AND   ( :TABLE_LIKE IS NULL OR table_name LIKE UPPER(:TABLE_LIKE) || '%' )
+params AS (
+  SELECT
+    UPPER(NVL('&&OWNER_LIKE','%')) AS owner_like,
+    UPPER(NVL('&&TABLE_LIKE','%')) AS table_like
+  FROM dual
 ),
-dict AS (  -- 표준 주석 사전: 대상 테이블의 컬럼만 집계(최빈)
-  SELECT scc.column_name, scc.comments AS standard_comment
-  FROM (
-    SELECT cc.column_name, cc.comments,
-           COUNT(*) AS cnt,
-           ROW_NUMBER() OVER (PARTITION BY cc.column_name
-                              ORDER BY COUNT(*) DESC, MIN(cc.table_name) ASC) rn
-    FROM   ALL_COL_COMMENTS cc
-    JOIN   tgt t ON t.owner=cc.owner AND t.table_name=cc.table_name
-    WHERE  cc.comments IS NOT NULL
-    GROUP  BY cc.column_name, cc.comments
-  ) scc
-  WHERE scc.rn = 1
+
+-- 1) 대상 테이블 (접근 가능한 테이블만)
+targets AS (
+  SELECT t.owner, t.table_name
+  FROM all_tables t
+  CROSS JOIN params p
+  WHERE UPPER(t.owner) LIKE p.owner_like
+    AND UPPER(t.table_name) LIKE p.table_like
 ),
-tab_cmt AS (  -- 테이블 코멘트: 없으면 표준사전으로 보충
-  SELECT t.owner owner_, t.table_name table_name_,
-         CASE
-           WHEN tc.comments IS NOT NULL AND TRIM(tc.comments) <> '' THEN
-             TO_CLOB('COMMENT ON TABLE '||t.owner||'.'||t.table_name||
-                     ' IS q''['||REPLACE(tc.comments, '''', '''''')||']'';')
-           WHEN d.standard_comment IS NOT NULL THEN
-             TO_CLOB('COMMENT ON TABLE '||t.owner||'.'||t.table_name||
-                     ' IS q''['||REPLACE(d.standard_comment, '''', '''''')||']'';')
-           ELSE TO_CLOB('')
-         END ddl_clob
-  FROM tgt t
-  LEFT JOIN ALL_TAB_COMMENTS tc
-    ON tc.owner=t.owner AND tc.table_name=t.table_name
-  LEFT JOIN dict d ON UPPER(d.column_name)=UPPER(t.table_name)
+
+-- 2) CREATE TABLE DDL (DBMS_METADATA.GET_DDL)
+create_ddl AS (
+  SELECT
+    t.owner,
+    t.table_name,
+    1 AS seq,
+    DBMS_METADATA.GET_DDL('TABLE', t.table_name, t.owner) AS out_ddl
+  FROM targets t
 ),
-col_cmt AS (  -- 컬럼 코멘트: 없으면 표준사전으로 보충
-  SELECT c.owner owner_, c.table_name table_name_,
-         XMLAGG(
-           XMLELEMENT(
-             "x",
-             'COMMENT ON COLUMN '||c.owner||'.'||c.table_name||'.'||c.column_name||
-             ' IS q''['||
-             REPLACE(COALESCE(NULLIF(TRIM(cc.comments), ''), d.standard_comment), '''', '''''')||
-             ']'';'||CHR(10)
-           )
-           ORDER BY c.column_id
-         ).EXTRACT('//text()').getClobVal() ddl_clob
-  FROM ALL_TAB_COLUMNS c
-  JOIN tgt t ON t.owner=c.owner AND t.table_name=c.table_name
-  LEFT JOIN ALL_COL_COMMENTS cc
-    ON cc.owner=c.owner AND cc.table_name=c.table_name AND cc.column_name=c.column_name
-  LEFT JOIN dict d ON UPPER(d.column_name)=UPPER(c.column_name)
-  WHERE (cc.comments IS NOT NULL AND TRIM(cc.comments)<>'' OR d.standard_comment IS NOT NULL)
-  GROUP BY c.owner, c.table_name
+
+-- 3) 원본 코멘트
+orig_tab_cmt AS (
+  SELECT atc.owner, atc.table_name, atc.comments
+  FROM all_tab_comments atc
+  JOIN targets t ON t.owner=atc.owner AND t.table_name=atc.table_name
 ),
-pkuk AS (  -- PK/UK만 생성
-  SELECT ac.owner owner_, ac.table_name table_name_,
-         XMLAGG(
-           XMLELEMENT(
-             "x",
-             TO_CLOB(
-               'ALTER TABLE '||ac.owner||'.'||ac.table_name||
-               ' ADD CONSTRAINT '||ac.constraint_name||' '||
-               CASE ac.constraint_type WHEN 'P' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END||
-               ' ('||
-               (SELECT LISTAGG(acc.column_name, ', ') WITHIN GROUP (ORDER BY acc.position)
-                  FROM ALL_CONS_COLUMNS acc
-                 WHERE acc.owner=ac.owner AND acc.constraint_name=ac.constraint_name)||
-               ');'||CHR(10)
-             )
-           )
-           ORDER BY CASE ac.constraint_type WHEN 'P' THEN 1 ELSE 2 END, ac.constraint_name
-         ).EXTRACT('//text()').getClobVal() ddl_clob
-  FROM ALL_CONSTRAINTS ac
-  JOIN tgt t ON t.owner=ac.owner AND t.table_name=ac.table_name
-  WHERE ac.constraint_type IN ('P','U')
-  GROUP BY ac.owner, ac.table_name
+orig_col_cmt AS (
+  SELECT acc.owner, acc.table_name, acc.column_name, acc.comments
+  FROM all_col_comments acc
+  JOIN targets t ON t.owner=acc.owner AND t.table_name=acc.table_name
 ),
-fk AS (  -- FK만 생성
-  SELECT ac.owner owner_, ac.table_name table_name_,
-         XMLAGG(
-           XMLELEMENT(
-             "x",
-             TO_CLOB(
-               'ALTER TABLE '||ac.owner||'.'||ac.table_name||
-               ' ADD CONSTRAINT '||ac.constraint_name||' FOREIGN KEY ('||
-               (SELECT LISTAGG(cc.column_name, ', ') WITHIN GROUP (ORDER BY cc.position)
-                  FROM ALL_CONS_COLUMNS cc
-                 WHERE cc.owner=ac.owner AND cc.constraint_name=ac.constraint_name)||
-               ') REFERENCES '||rcon.owner||'.'||rcon.table_name||' ('||
-               (SELECT LISTAGG(rcc.column_name, ', ') WITHIN GROUP (ORDER BY rcc.position)
-                  FROM ALL_CONS_COLUMNS rcc
-                 WHERE rcc.owner=rcon.owner AND rcc.constraint_name=rcon.constraint_name)||
-               ')'||
-               CASE ac.delete_rule WHEN 'CASCADE' THEN ' ON DELETE CASCADE' ELSE '' END||
-               ';'||CHR(10)
-             )
-           )
-           ORDER BY ac.constraint_name
-         ).EXTRACT('//text()').getClobVal() ddl_clob
-  FROM ALL_CONSTRAINTS ac
-  JOIN ALL_CONSTRAINTS rcon
-    ON rcon.owner=ac.r_owner AND rcon.constraint_name=ac.r_constraint_name
-  JOIN tgt t ON t.owner=ac.owner AND t.table_name=ac.table_name
-  WHERE ac.constraint_type='R'
-  GROUP BY ac.owner, ac.table_name
+
+-- 4) 용어 사전(테이블): 정규화명별 최빈 코멘트
+tab_dict_base AS (
+  SELECT
+    REGEXP_REPLACE(
+      REGEXP_REPLACE(UPPER(atc.table_name), '^(TBL_|TB_|T_|CM_|IF_|DM_|CD_|DT_|VW_|MV_|X_)+', ''),
+      '[0-9]', ''
+    ) AS norm_name,
+    atc.comments
+  FROM all_tab_comments atc
+  WHERE atc.comments IS NOT NULL
+),
+tab_dict_rank AS (
+  SELECT
+    norm_name, comments,
+    COUNT(*) AS freq,
+    ROW_NUMBER() OVER (PARTITION BY norm_name ORDER BY COUNT(*) DESC, LENGTH(comments) DESC) AS rn
+  FROM tab_dict_base
+  GROUP BY norm_name, comments
+),
+tab_dict AS (
+  SELECT norm_name, comments AS dict_comment
+  FROM tab_dict_rank
+  WHERE rn=1
+),
+
+-- 5) 용어 사전(컬럼): 컬럼명별 최빈 코멘트
+col_dict_rank AS (
+  SELECT
+    UPPER(acc.column_name) AS col_name,
+    acc.comments,
+    COUNT(*) AS freq,
+    ROW_NUMBER() OVER (PARTITION BY UPPER(acc.column_name) ORDER BY COUNT(*) DESC, LENGTH(acc.comments) DESC) AS rn
+  FROM all_col_comments acc
+  WHERE acc.comments IS NOT NULL
+  GROUP BY UPPER(acc.column_name), acc.comments
+),
+col_dict AS (
+  SELECT col_name, comments AS dict_comment
+  FROM col_dict_rank
+  WHERE rn=1
+),
+
+-- 6) 테이블 코멘트(원본 우선, 없으면 사전)
+final_tab_cmt AS (
+  SELECT
+    t.owner, t.table_name,
+    CASE
+      WHEN otc.comments IS NOT NULL THEN 'ORIG:'||otc.comments
+      ELSE CASE
+             WHEN td.dict_comment IS NOT NULL THEN 'DICT:'||td.dict_comment
+           END
+    END AS tagged_comment
+  FROM targets t
+  LEFT JOIN orig_tab_cmt otc
+    ON otc.owner=t.owner AND otc.table_name=t.table_name
+  LEFT JOIN (
+    SELECT
+      tt.owner, tt.table_name,
+      td.dict_comment
+    FROM targets tt
+    LEFT JOIN tab_dict td
+      ON td.norm_name = REGEXP_REPLACE(
+           REGEXP_REPLACE(UPPER(tt.table_name), '^(TBL_|TB_|T_|CM_|IF_|DM_|CD_|DT_|VW_|MV_|X_)+', ''),
+           '[0-9]', ''
+         )
+  ) td
+    ON td.owner=t.owner AND td.table_name=t.table_name
+),
+
+-- 7) 컬럼 코멘트(원본 우선, 없으면 사전)
+final_col_cmt AS (
+  SELECT
+    c.owner, c.table_name, c.column_name, c.column_id,
+    CASE
+      WHEN occ.comments IS NOT NULL THEN 'ORIG:'||occ.comments
+      ELSE CASE
+             WHEN cd.dict_comment IS NOT NULL THEN 'DICT:'||cd.dict_comment
+           END
+    END AS tagged_comment
+  FROM all_tab_columns c
+  JOIN targets t
+    ON t.owner=c.owner AND t.table_name=c.table_name
+  LEFT JOIN orig_col_cmt occ
+    ON occ.owner=c.owner AND occ.table_name=c.table_name AND occ.column_name=c.column_name
+  LEFT JOIN col_dict cd
+    ON cd.col_name = UPPER(c.column_name)
+),
+
+-- 8) COMMENT DDL 생성 (문자열 이스케이프 + 길이 절단)
+tab_comment_ddl AS (
+  SELECT
+    ftc.owner, ftc.table_name, 2 AS seq,
+    TO_CLOB(
+      'COMMENT ON TABLE "'||ftc.owner||'"."'||ftc.table_name||'" IS ' ||
+      CASE
+        WHEN ftc.tagged_comment IS NULL THEN 'NULL'
+        ELSE
+          ''''|| REPLACE(
+                  SUBSTR(
+                    CASE
+                      WHEN SUBSTR(ftc.tagged_comment,1,5)='ORIG:' THEN SUBSTR(ftc.tagged_comment,6)
+                      WHEN SUBSTR(ftc.tagged_comment,1,5)='DICT:' THEN '[사전] '||SUBSTR(ftc.tagged_comment,6)
+                      ELSE ftc.tagged_comment
+                    END, 1, 3900
+                  ), '''', ''''''
+                ) || ''''
+      END ||
+      CASE
+        WHEN ftc.tagged_comment IS NULL THEN ''
+        WHEN SUBSTR(ftc.tagged_comment,1,5)='ORIG:' THEN ' ; -- 원본'
+        ELSE ' ; -- 자동(사전)'
+      END
+    ) AS out_ddl
+  FROM final_tab_cmt ftc
+),
+col_comment_ddl AS (
+  SELECT
+    fcc.owner, fcc.table_name, 3 AS seq, fcc.column_id,
+    TO_CLOB(
+      'COMMENT ON COLUMN "'||fcc.owner||'"."'||fcc.table_name||'"."'||fcc.column_name||'" IS ' ||
+      CASE
+        WHEN fcc.tagged_comment IS NULL THEN 'NULL'
+        ELSE
+          ''''|| REPLACE(
+                  SUBSTR(
+                    CASE
+                      WHEN SUBSTR(fcc.tagged_comment,1,5)='ORIG:' THEN SUBSTR(fcc.tagged_comment,6)
+                      WHEN SUBSTR(fcc.tagged_comment,1,5)='DICT:' THEN '[사전] '||SUBSTR(fcc.tagged_comment,6)
+                      ELSE fcc.tagged_comment
+                    END, 1, 3900
+                  ), '''', ''''''
+                ) || ''''
+      END ||
+      CASE
+        WHEN fcc.tagged_comment IS NULL THEN ''
+        WHEN SUBSTR(fcc.tagged_comment,1,5)='ORIG:' THEN ' ; -- 원본'
+        ELSE ' ; -- 자동(사전)'
+      END
+    ) AS out_ddl
+  FROM final_col_cmt fcc
 )
-SELECT
-  t.owner,
-  t.table_name,
-  DBMS_METADATA.get_ddl('TABLE', t.table_name, t.owner)
-  || CASE WHEN pkuk.ddl_clob IS NOT NULL THEN TO_CLOB(CHR(10))||pkuk.ddl_clob ELSE TO_CLOB('') END
-  || CASE WHEN fk.ddl_clob   IS NOT NULL THEN TO_CLOB(CHR(10))||fk.ddl_clob   ELSE TO_CLOB('') END
-  || CASE WHEN tab.ddl_clob  IS NOT NULL AND LENGTH(tab.ddl_clob)>0
-          THEN TO_CLOB(CHR(10))||tab.ddl_clob ELSE TO_CLOB('') END
-  || CASE WHEN col.ddl_clob  IS NOT NULL AND LENGTH(col.ddl_clob)>0
-          THEN TO_CLOB(CHR(10))||col.ddl_clob ELSE TO_CLOB('') END AS full_ddl
-FROM tgt t
-LEFT JOIN pkuk     ON pkuk.owner_ = t.owner AND pkuk.table_name_ = t.table_name
-LEFT JOIN fk       ON fk.owner_   = t.owner AND fk.table_name_   = t.table_name
-LEFT JOIN tab_cmt tab ON tab.owner_ = t.owner AND tab.table_name_ = t.table_name
-LEFT JOIN col_cmt col ON col.owner_ = t.owner AND col.table_name_ = t.table_name
-ORDER BY t.table_name;
+
+-- 9) 최종 출력: CREATE → TABLE COMMENT → COLUMN COMMENT(컬럼순)
+SELECT out_ddl
+FROM (
+  SELECT owner, table_name, seq, 0 AS col_order, out_ddl FROM create_ddl
+  UNION ALL
+  SELECT owner, table_name, seq, 0 AS col_order, out_ddl FROM tab_comment_ddl
+  UNION ALL
+  SELECT owner, table_name, seq, NVL(column_id,0) AS col_order, out_ddl FROM col_comment_ddl
+)
+ORDER BY owner, table_name, seq, col_order;
