@@ -1,7 +1,18 @@
+-- =========================================================
+-- 테이블별 1행: CREATE TABLE + COMMENT DDL 묶음(CLOB)
+--   - DBMS_METADATA.GET_DDL 사용 (관리 테이블 없음)
+--   - 결과 CLOB 내부의 모든 " 를 ' 로 치환 (ERD 참조용)
+--   - 각 테이블 블록 맨 앞에 "===== 테이블 구분선 =====" 추가
+-- 파라미터:
+--   &OWNER_LIKE  (기본 '%')
+--   &TABLE_LIKE  (기본 '%')
+-- =========================================================
+
 BEGIN
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE);
+  -- 제약조건은 ERD 재구성에 유용하므로 기본 유지
 END;
 /
 
@@ -9,11 +20,11 @@ WITH
 params AS (
   SELECT
     UPPER(NVL('&&OWNER_LIKE','%')) AS owner_like,
-    UPPER(NVL('&&TABLE_LIKE','%')) AS table_like,
-    UPPER(NVL('&&DQ_TO_SQ','N'))   AS dq_to_sq
+    UPPER(NVL('&&TABLE_LIKE','%')) AS table_like
   FROM dual
 ),
 
+-- 1) 대상 테이블
 targets AS (
   SELECT t.owner, t.table_name
   FROM all_tables t
@@ -22,14 +33,14 @@ targets AS (
     AND UPPER(t.table_name) LIKE p.table_like
 ),
 
--- CREATE TABLE DDL
+-- 2) CREATE TABLE DDL
 create_ddl AS (
   SELECT t.owner, t.table_name, 1 AS seq, 0 AS col_order,
          DBMS_METADATA.GET_DDL('TABLE', t.table_name, t.owner) AS line_clob
   FROM targets t
 ),
 
--- 원본 코멘트
+-- 3) 원본 코멘트
 orig_tab_cmt AS (
   SELECT atc.owner, atc.table_name, atc.comments
   FROM all_tab_comments atc
@@ -41,7 +52,7 @@ orig_col_cmt AS (
   JOIN targets t ON t.owner=acc.owner AND t.table_name=acc.table_name
 ),
 
--- 사전(테이블)
+-- 4) 용어사전(테이블): 정규화 키별 최빈 코멘트
 tab_dict_base AS (
   SELECT
     REGEXP_REPLACE(
@@ -53,8 +64,9 @@ tab_dict_base AS (
   WHERE atc.comments IS NOT NULL
 ),
 tab_dict_rank AS (
-  SELECT norm_name, comments, COUNT(*) freq,
-         ROW_NUMBER() OVER (PARTITION BY norm_name ORDER BY COUNT(*) DESC, LENGTH(comments) DESC) rn
+  SELECT norm_name, comments,
+         COUNT(*) AS freq,
+         ROW_NUMBER() OVER (PARTITION BY norm_name ORDER BY COUNT(*) DESC, LENGTH(comments) DESC) AS rn
   FROM tab_dict_base
   GROUP BY norm_name, comments
 ),
@@ -64,10 +76,11 @@ tab_dict AS (
   WHERE rn=1
 ),
 
--- 사전(컬럼)
+-- 5) 용어사전(컬럼): 컬럼명별 최빈 코멘트
 col_dict_rank AS (
-  SELECT UPPER(acc.column_name) col_name, acc.comments, COUNT(*) freq,
-         ROW_NUMBER() OVER (PARTITION BY UPPER(acc.column_name) ORDER BY COUNT(*) DESC, LENGTH(acc.comments) DESC) rn
+  SELECT UPPER(acc.column_name) AS col_name, acc.comments,
+         COUNT(*) AS freq,
+         ROW_NUMBER() OVER (PARTITION BY UPPER(acc.column_name) ORDER BY COUNT(*) DESC, LENGTH(acc.comments) DESC) AS rn
   FROM all_col_comments acc
   WHERE acc.comments IS NOT NULL
   GROUP BY UPPER(acc.column_name), acc.comments
@@ -78,7 +91,7 @@ col_dict AS (
   WHERE rn=1
 ),
 
--- 최종 코멘트 소스
+-- 6) 최종 코멘트(원본 우선 → 사전)
 final_tab_cmt AS (
   SELECT t.owner, t.table_name,
          CASE
@@ -113,19 +126,13 @@ final_col_cmt AS (
     ON cd.col_name = UPPER(c.column_name)
 ),
 
--- 한 줄씩 만들기
-sep_line AS (
-  SELECT t.owner, t.table_name, 0 AS seq, 0 AS col_order,
-         TO_CLOB('-- ===== 테이블 구분선 =====') AS line_clob
-  FROM targets t
-),
-create_line AS (
-  SELECT owner, table_name, 1 AS seq, 0 AS col_order,
-         CASE
-           WHEN REGEXP_LIKE(line_clob, ';\s*$', 'n') THEN line_clob
-           ELSE line_clob || CHR(10) || ';'
-         END AS line_clob
-  FROM create_ddl
+-- 7) 라인 생성 (나중에 합치기)
+sep_line AS (  -- 구분선(가독성)
+  SELECT owner, table_name, 0 AS seq, 0 AS col_order,
+         TO_CLOB('===== 테이블 구분선 =====') || CHR(10) ||
+         TO_CLOB('-- ') || owner || '.' || table_name || CHR(10)
+         AS line_clob
+  FROM targets
 ),
 tab_comment_line AS (
   SELECT
@@ -180,16 +187,21 @@ col_comment_line AS (
   FROM final_col_cmt fcc
 ),
 
--- CREATE/COMMENT 라인 결합(이스케이프 제거 목적: text() 추출)
+-- 8) CREATE/COMMENT 라인에 개행 추가 + "→' 치환
 all_lines AS (
   SELECT owner, table_name, seq, col_order,
-         CASE WHEN seq IN (0,2,3) THEN line_clob || CHR(10)
-              WHEN seq=1 THEN line_clob || CHR(10)
-         END AS line_with_nl
+         -- 세미콜론 보정(+개행) 후 전체 라인에서 " 를 ' 로 치환
+         REPLACE(
+           CASE
+             WHEN seq = 1 AND REGEXP_LIKE(line_clob, ';\s*$', 'n') THEN line_clob || CHR(10)
+             WHEN seq = 1 THEN line_clob || CHR(10) || ';' || CHR(10)
+             ELSE line_clob || CHR(10)
+           END
+         , '"', '''') AS line_with_nl
   FROM (
     SELECT * FROM sep_line
     UNION ALL
-    SELECT * FROM create_line
+    SELECT * FROM create_ddl
     UNION ALL
     SELECT * FROM tab_comment_line
     UNION ALL
@@ -197,21 +209,16 @@ all_lines AS (
   )
 )
 
+-- 9) 테이블당 1행(CLOB)으로 합치기
 SELECT
-  a.owner,
-  a.table_name,
-  CASE
-    WHEN (SELECT dq_to_sq FROM params) = 'Y'
-    THEN REPLACE(
-           XMLTYPE(
-             XMLAGG( XMLELEMENT(e, a.line_with_nl) ORDER BY seq, col_order )
-           ).EXTRACT('//text()').getClobVal(),
-           '"', ''''
-         )
-    ELSE XMLTYPE(
-           XMLAGG( XMLELEMENT(e, a.line_with_nl) ORDER BY seq, col_order )
-         ).EXTRACT('//text()').getClobVal()
-  END AS ddl_block
-FROM all_lines a
-GROUP BY a.owner, a.table_name
-ORDER BY a.owner, a.table_name;
+  owner,
+  table_name,
+  XMLSERIALIZE(
+    CONTENT XMLAGG(
+      XMLELEMENT("L", line_with_nl)
+      ORDER BY seq, col_order
+    ) AS CLOB
+  ) AS ddl_for_erd
+FROM all_lines
+GROUP BY owner, table_name
+ORDER BY owner, table_name;
