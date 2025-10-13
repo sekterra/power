@@ -1,18 +1,23 @@
 -- =========================================================
--- 테이블별 1행: CREATE TABLE + COMMENT DDL 묶음(CLOB)
---   - DBMS_METADATA.GET_DDL 사용 (관리 테이블 없음)
---   - 결과 CLOB 내부의 모든 " 를 ' 로 치환 (ERD 참조용)
---   - 각 테이블 블록 맨 앞에 "===== 테이블 구분선 =====" 추가
+-- [결과] 테이블당 1행 CLOB:
+--   "===== 테이블 구분선 =====" + CREATE TABLE + COMMENT DDL
+--   - DBMS_METADATA.GET_DDL 사용(관리 테이블 없이)
+--   - 결과 문자열 내부에 XML 이스케이프가 절대 보이지 않도록 처리(XMLCDATA 사용)
+--   - " 를 ' 로 치환 (ERD 참고용; 실행용 SQL엔 부적합)
 -- 파라미터:
 --   &OWNER_LIKE  (기본 '%')
 --   &TABLE_LIKE  (기본 '%')
+-- 권장 환경설정(SQL*Plus/Developer):
+--   SET DEFINE OFF
+--   SET LONG 1000000
+--   SET PAGESIZE 0 TRIMSPOOL ON
 -- =========================================================
 
 BEGIN
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
   DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE);
-  -- 제약조건은 ERD 재구성에 유용하므로 기본 유지
+  -- 제약조건은 ERD 복원에 유용하므로 기본 유지
 END;
 /
 
@@ -126,12 +131,11 @@ final_col_cmt AS (
     ON cd.col_name = UPPER(c.column_name)
 ),
 
--- 7) 라인 생성 (나중에 합치기)
-sep_line AS (  -- 구분선(가독성)
+-- 7) 라인 생성 (구분선 + CREATE + COMMENT)
+sep_line AS (
   SELECT owner, table_name, 0 AS seq, 0 AS col_order,
          TO_CLOB('===== 테이블 구분선 =====') || CHR(10) ||
-         TO_CLOB('-- ') || owner || '.' || table_name || CHR(10)
-         AS line_clob
+         TO_CLOB('-- ') || owner || '.' || table_name || CHR(10) AS line_clob
   FROM targets
 ),
 tab_comment_line AS (
@@ -187,10 +191,9 @@ col_comment_line AS (
   FROM final_col_cmt fcc
 ),
 
--- 8) CREATE/COMMENT 라인에 개행 추가 + "→' 치환
+-- 8) 개행/세미콜론 보정 + "→' 치환
 all_lines AS (
   SELECT owner, table_name, seq, col_order,
-         -- 세미콜론 보정(+개행) 후 전체 라인에서 " 를 ' 로 치환
          REPLACE(
            CASE
              WHEN seq = 1 AND REGEXP_LIKE(line_clob, ';\s*$', 'n') THEN line_clob || CHR(10)
@@ -207,18 +210,37 @@ all_lines AS (
     UNION ALL
     SELECT * FROM col_comment_line
   )
+),
+
+-- 9) XMLCDATA로 escape 차단하여 집계
+xml_block AS (
+  SELECT
+    owner,
+    table_name,
+    XMLAGG(
+      XMLELEMENT("L", XMLCDATA(line_with_nl))
+      ORDER BY seq, col_order
+    ) AS xdoc
+  FROM all_lines
+  GROUP BY owner, table_name
 )
 
--- 9) 테이블당 1행(CLOB)으로 합치기
+-- 10) 직렬화 후 태그 제거 → 순수 텍스트만 남김
 SELECT
   owner,
   table_name,
-  XMLSERIALIZE(
-    CONTENT XMLAGG(
-      XMLELEMENT("L", line_with_nl)
-      ORDER BY seq, col_order
-    ) AS CLOB
+  REGEXP_REPLACE(
+    REGEXP_REPLACE(
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(
+          XMLSERIALIZE(CONTENT xdoc AS CLOB),
+          '</L>',                ''          -- 닫는 태그 제거
+        ),
+        '<L><!\[CDATA\[',        ''          -- 여는 태그 + CDATA 시작 제거
+      ),
+      '\]\]>',                   ''          -- CDATA 끝 제거
+    ),
+    '<L>',                       ''          -- 혹시 남은 여는 태그 제거(안전망)
   ) AS ddl_for_erd
-FROM all_lines
-GROUP BY owner, table_name
+FROM xml_block
 ORDER BY owner, table_name;
